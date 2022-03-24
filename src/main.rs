@@ -1,5 +1,5 @@
 use clap::Command;
-use gpgme::{Context, Protocol};
+use gpgme::{Context, KeyListMode, Protocol};
 use std::io::prelude::*;
 use std::{
     env, fs,
@@ -15,7 +15,8 @@ fn load_password_store() -> anyhow::Result<PasswordStore> {
         .ok()
         .or_else(|| {
             panic!("Home Environment varible not set"); // TODO handle windows
-        }).unwrap();
+        })
+        .unwrap();
 
     let password_dir = PathBuf::from(home_dir_env).join(".password-store");
 
@@ -54,10 +55,10 @@ fn dmenu(pass_store: &PasswordStore, clip: bool) -> anyhow::Result<()> {
     let password_str = pass_store.get_password(&selection_str.trim())?;
 
     if clip {
-		cb_set_contents(&password_str).map_err(|e| {
-			eprintln!("Cannot write to clipboard: {}", e);
-			e
-		})?;
+        cb_set_contents(&password_str).map_err(|e| {
+            eprintln!("Cannot write to clipboard: {}", e);
+            e
+        })?;
     }
     Ok(())
 }
@@ -67,12 +68,14 @@ fn main() {
         .version("0.1.0")
         .about("unix password helper")
         .arg(clap::arg!(-f --find [SEARCH] "String to search password store for"))
+        .arg(clap::arg!(-a --add [LOC] "add new password to location"))
+        .arg(clap::arg!(-r --remove [SEARCH] "add new password to location"))
+        .arg(clap::arg!(-s --show [SEARCH] "Print the password at the location to stdout"))
         .arg(clap::arg!(-l --list ... "List all passwords in password store"))
-        .arg(clap::arg!(-s --show [LOC] "Print the password at the location to stdout"))
         .arg(clap::arg!(-d --dmenu ... "Dmenu integration"))
         .arg(clap::arg!(-c --clip ... "Use xclip to copy to system clipboard"))
         .get_matches();
-    let pass_store = load_password_store().expect("Load password failed");
+    let mut pass_store = load_password_store().expect("Load password failed");
 
     if matches.is_present("list") {
         pass_store
@@ -80,32 +83,50 @@ fn main() {
             .map_err(|e| panic!("{}", e))
             .ok();
     } else if let Some(search) = matches.value_of("find") {
-        let matches = pass_store
-            .search(search)
-            .map_err(|e| {
-                panic!("{}", e);
-            })
-            .expect("no err");
-
-        if matches.len() == 1 {
-            let pass = pass_store
-                .get_password(&matches[0])
-                .map_err(|e| {
-                    panic!("{}", e);
-                })
-                .expect("no err");
-            println!("{}", pass);
-        } else {
-            matches.iter().for_each(|m| println!("{}", m));
+        match pass_store.search(search) {
+            Ok(pass) => {
+                println!("{}", pass);
+                cb_set_contents(&pass)
+                    .map_err(|e| eprintln!("error setting clipboard {}", e))
+                    .ok();
+            }
+            Err(_) => println!("Narrow your search"),
         }
     } else if let Some(location) = matches.value_of("show") {
-        let pass = pass_store
-            .get_password(location)
+        match pass_store.search(location) {
+            Err(e) => e.iter().for_each(|p| println!("{}", p)),
+            Ok(pass) => {
+                println!("{}", pass);
+                cb_set_contents(&pass)
+                    .map_err(|e| eprintln!("error setting clipboard {}", e))
+                    .ok();
+            }
+        }
+    } else if let Some(location) = matches.value_of("remove") {
+        pass_store
+            .remove_password(location)
             .map_err(|e| {
                 panic!("{}", e);
             })
+            .ok();
+    } else if let Some(location) = matches.value_of("add") {
+        print!("pass: ");
+        std::io::stdout()
+            .flush()
+            .expect("failed to write to stdout");
+        let console = console::Term::stdout();
+        let pass = console
+            .read_secure_line()
+            .map_err(|e| {
+                eprintln!("error {}", e);
+            })
             .expect("no err");
-        println!("{}", pass);
+        pass_store
+            .add_password(location, &pass)
+            .map_err(|e| {
+                panic!("{}", e);
+            })
+            .expect("noerr");
     } else if matches.is_present("dmenu") {
         dmenu(&pass_store, matches.is_present("clip"))
             .map_err(|e| {
@@ -120,21 +141,17 @@ struct PasswordStore {
     files: Vec<fs::DirEntry>,
 }
 
-struct Password {
-    val: String,
-}
-
 impl PasswordStore {
-    fn decrypt_file(file_path: &Path) -> Result<Password, anyhow::Error> {
+    fn decrypt_file(file_path: &Path) -> anyhow::Result<String> {
         let mut ctx = Context::from_protocol(Protocol::OpenPgp)?;
         let mut input = fs::File::open(file_path)?;
         let mut output = Vec::new();
         let _result = ctx.decrypt(&mut input, &mut output)?;
         let pass = String::from_utf8(output)?;
-        Ok(Password { val: pass })
+        Ok(pass)
     }
 
-    fn get_relative_path(self: &Self, path2: &Path) -> PathBuf {
+    fn get_relative_path(&self, path2: &Path) -> PathBuf {
         let mut path = PathBuf::new();
         path2
             .components()
@@ -144,17 +161,17 @@ impl PasswordStore {
         path
     }
 
-    fn search(self: &Self, s: &str) -> anyhow::Result<Vec<String>> {
-        let re = regex::Regex::new(s)?;
-        Ok(self
-            .files
-            .iter()
-            .map(|file| String::from(self.get_relative_path(&file.path()).to_str().unwrap()))
-            .filter(|s| re.is_match(s))
-            .collect())
+    fn search(&self, s: &str) -> Result<String, Vec<String>> {
+        match self.search_to_path(s) {
+            Ok(p) => Self::decrypt_file(&p).map_err(|e| panic!("{}:{} {}", file!(), line!(), e)),
+            Err(ps) => Err(ps
+                .iter()
+                .map(|p| String::from(p.to_str().unwrap()))
+                .collect()),
+        }
     }
 
-    fn write_list(self: &Self, w: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    fn write_list(&self, w: &mut dyn std::io::Write) -> anyhow::Result<()> {
         let re = regex::Regex::new(".gpg$")?;
         self.files.iter().for_each(|pass_file| {
             self.get_relative_path(&pass_file.path())
@@ -165,21 +182,74 @@ impl PasswordStore {
         Ok(())
     }
 
-    fn get_password(self: &Self, name: &str) -> Result<String, anyhow::Error> {
-        let re = regex::Regex::new(".gpg$")?;
+    fn ensure_gpg_filetype(name: &str) -> String {
+        let re = regex::Regex::new(".gpg$").expect("static regex failed to compile");
         if !re.is_match(name) {
             // TODO map error case and try to find file as it was passed
-            return self.get_password(&format!("{}.gpg", name));
+            format!("{}.gpg", name)
+        } else {
+            String::from(name)
         }
+    }
 
-        let pass_path = Path::new(name);
+    fn search_to_path(&self, search: &str) -> Result<PathBuf, Vec<PathBuf>> {
+        let re = regex::Regex::new(search).expect("error on search regex");
+        let res: Vec<PathBuf> = self
+            .files
+            .iter()
+            .map(|file| self.get_relative_path(&file.path()))
+            .filter(|p| re.is_match(p.to_str().unwrap()))
+            .collect();
+
+        if res.len() == 1 {
+            return Ok(res.into_iter().next().unwrap());
+        } else {
+            return Err(res);
+        }
+    }
+
+    fn location_to_path(&self, location: &str) -> PathBuf {
+        let pass_path = Path::new(location);
         let mut root_path = self.root.clone();
         for c in pass_path.components() {
             root_path.push(c);
         }
+        root_path
+    }
 
-        let password = Self::decrypt_file(&root_path)?;
-        Ok(password.val)
+    fn remove_password(&mut self, name: &str) -> anyhow::Result<()> {
+        let name = Self::ensure_gpg_filetype(name);
+        fs::remove_file(self.location_to_path(&name))?;
+        Ok(())
+    }
+
+    fn add_password(&mut self, name: &str, value: &str) -> anyhow::Result<()> {
+        let name = Self::ensure_gpg_filetype(name);
+
+        let mut new_file = fs::File::create(self.location_to_path(&name))?;
+        let mut ctx = Context::from_protocol(Protocol::OpenPgp)?;
+
+        let mut mode = KeyListMode::empty();
+        mode.insert(KeyListMode::LOCAL);
+        ctx.set_key_list_mode(mode)?;
+        let key = ctx
+            .keys()?
+            .filter_map(|x| x.ok())
+            .filter(|x| x.can_encrypt())
+            .next()
+            .unwrap(); // TODO allow choosing which key gets used not just first one that can encrypt
+
+        let (plaintext, mut ciphertext) = (value, Vec::new());
+        ctx.encrypt(Some(&key), plaintext, &mut ciphertext)?;
+
+        new_file.write_all(&ciphertext)?;
+        Ok(())
+    }
+
+    fn get_password(&self, name: &str) -> Result<String, anyhow::Error> {
+        let name = Self::ensure_gpg_filetype(name);
+
+        Ok(Self::decrypt_file(&self.location_to_path(&name))?)
     }
 
     fn from_directory(path: &Path) -> anyhow::Result<Self> {
