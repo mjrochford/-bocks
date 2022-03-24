@@ -10,13 +10,12 @@ use std::{
 fn load_password_store() -> anyhow::Result<PasswordStore> {
     let home_dir_env = env::var("HOME")
         .map_err(|e| {
-            panic!("Error reading home dir: {}", e);
+            panic!("{}:{} Error reading home dir: {}", file!(), line!(), e);
         })
         .ok()
         .or_else(|| {
             panic!("Home Environment varible not set"); // TODO handle windows
-        })
-        .unwrap();
+        }).unwrap();
 
     let password_dir = PathBuf::from(home_dir_env).join(".password-store");
 
@@ -25,17 +24,41 @@ fn load_password_store() -> anyhow::Result<PasswordStore> {
     Ok(password_store)
 }
 
-fn dmenu(pass_store: &PasswordStore) -> anyhow::Result<()> {
-    let proc = process::Command::new("dmenu")
+fn cb_set_contents(s: &str) -> anyhow::Result<()> {
+    let xclip_proc = process::Command::new("xclip")
+        .arg("-selection")
+        .arg("clip")
+        .stdin(process::Stdio::piped())
+        .spawn()?;
+
+    let mut xclip_stdin = xclip_proc.stdin.unwrap();
+    write!(&mut xclip_stdin, "{}", s)?;
+    Ok(())
+}
+
+fn dmenu(pass_store: &PasswordStore, clip: bool) -> anyhow::Result<()> {
+    let dmenu_proc = process::Command::new("dmenu")
+        .arg("-p")
+        .arg("pass:")
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
         .spawn()?;
 
-    pass_store.write_list(&mut proc.stdin.unwrap())?;
-    let mut s = String::new();
-    proc.stdout.unwrap().read_to_string(&mut s)?;
+    pass_store.write_list(&mut dmenu_proc.stdin.unwrap())?;
+    let mut selection_str = String::new();
+    dmenu_proc
+        .stdout
+        .unwrap()
+        .read_to_string(&mut selection_str)?;
 
-    print!("{}", pass_store.get_password(s.trim())?);
+    let password_str = pass_store.get_password(&selection_str.trim())?;
+
+    if clip {
+		cb_set_contents(&password_str).map_err(|e| {
+			eprintln!("Cannot write to clipboard: {}", e);
+			e
+		})?;
+    }
     Ok(())
 }
 
@@ -47,6 +70,7 @@ fn main() {
         .arg(clap::arg!(-l --list ... "List all passwords in password store"))
         .arg(clap::arg!(-s --show [LOC] "Print the password at the location to stdout"))
         .arg(clap::arg!(-d --dmenu ... "Dmenu integration"))
+        .arg(clap::arg!(-c --clip ... "Use xclip to copy to system clipboard"))
         .get_matches();
     let pass_store = load_password_store().expect("Load password failed");
 
@@ -83,11 +107,11 @@ fn main() {
             .expect("no err");
         println!("{}", pass);
     } else if matches.is_present("dmenu") {
-        dmenu(&pass_store)
+        dmenu(&pass_store, matches.is_present("clip"))
             .map_err(|e| {
-                panic!("{}", e);
+                eprintln!("error {}", e);
             })
-            .unwrap();
+            .ok();
     }
 }
 
@@ -131,19 +155,23 @@ impl PasswordStore {
     }
 
     fn write_list(self: &Self, w: &mut dyn std::io::Write) -> anyhow::Result<()> {
-        for pass_file in &self.files {
-            write!(
-                w,
-                "{}\n",
-                self.get_relative_path(&pass_file.path())
-                    .to_str()
-                    .unwrap_or("error")
-            )?;
-        }
+        let re = regex::Regex::new(".gpg$")?;
+        self.files.iter().for_each(|pass_file| {
+            self.get_relative_path(&pass_file.path())
+                .to_str()
+                .map(|s| re.replace(s, "").into_owned())
+                .map(|loc| write!(w, "{}\n", loc));
+        });
         Ok(())
     }
 
     fn get_password(self: &Self, name: &str) -> Result<String, anyhow::Error> {
+        let re = regex::Regex::new(".gpg$")?;
+        if !re.is_match(name) {
+            // TODO map error case and try to find file as it was passed
+            return self.get_password(&format!("{}.gpg", name));
+        }
+
         let pass_path = Path::new(name);
         let mut root_path = self.root.clone();
         for c in pass_path.components() {
