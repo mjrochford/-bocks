@@ -1,8 +1,10 @@
-use clap::Command;
+use clap::{arg, Command};
 use gpgme::{Context, KeyListMode, Protocol};
 use std::io::prelude::*;
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs, io,
     path::{Component::RootDir, Path, PathBuf},
     process,
 };
@@ -64,20 +66,34 @@ fn dmenu(pass_store: &PasswordStore, clip: bool) -> anyhow::Result<()> {
 }
 
 fn main() {
-    let matches = Command::new("bocks")
+    let cmd = Command::new("bocks")
         .version("0.1.0")
         .about("unix password helper")
-        .arg(clap::arg!(-f --find [SEARCH] "String to search password store for"))
-        .arg(clap::arg!(-a --add [LOC] "add new password to location"))
-        .arg(clap::arg!(-r --remove [SEARCH] "add new password to location"))
-        .arg(clap::arg!(-s --show [SEARCH] "Print the password at the location to stdout"))
-        .arg(clap::arg!(-l --list ... "List all passwords in password store"))
-        .arg(clap::arg!(-d --dmenu ... "Dmenu integration"))
-        .arg(clap::arg!(-c --clip ... "Use xclip to copy to system clipboard"))
-        .get_matches();
+        .arg(arg!(-f --find [SEARCH] "String to search password store for"))
+        .arg(arg!(-a --add [LOC] "add new password to location"))
+        .arg(arg!(-r --remove [SEARCH] "add new password to location"))
+        .arg(arg!(-s --show [SEARCH] "Print the password at the location to stdout"))
+        .arg(arg!(-l --list ... "List all passwords in password store"))
+        .arg(arg!(-d --dmenu ... "Dmenu integration"))
+        .arg(arg!(-c --clip ... "Use xclip to copy to system clipboard"))
+        .subcommand(Command::new("git").allow_external_subcommands(true));
     let mut pass_store = load_password_store().expect("Load password failed");
 
-    if matches.is_present("list") {
+    let matches = cmd.get_matches();
+
+    if let Some(_) = matches.subcommand_matches("git") {
+        let git_args = env::args_os()
+            .skip_while(|s| s != "git")
+            .collect::<Vec<OsString>>();
+
+        let res = process::Command::new("git")
+            .current_dir(pass_store.root)
+            .args(&git_args[1..]) // ignore the git subcommand arg
+            .output()
+            .expect("Failed to run subprocess git");
+        io::stdout().write_all(&res.stdout).unwrap();
+        io::stderr().write_all(&res.stderr).unwrap();
+    } else if matches.is_present("list") {
         pass_store
             .write_list(&mut std::io::stdout())
             .map_err(|e| panic!("{}", e))
